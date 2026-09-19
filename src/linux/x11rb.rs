@@ -7,7 +7,10 @@ use x11rb::{
     protocol::{
         randr::ConnectionExt as _,
         xinput::DeviceUse,
-        xproto::{ConnectionExt as _, GetKeyboardMappingReply, GetModifierMappingReply, Screen},
+        xproto::{
+            ConnectionExt as _, GetKeyboardMappingReply, GetModifierMappingReply, ImageFormat,
+            ImageOrder, Screen,
+        },
         xtest::ConnectionExt as _,
     },
     rust_connection::{ConnectError, ConnectionError, DefaultStream, ReplyError, RustConnection},
@@ -15,8 +18,11 @@ use x11rb::{
 };
 
 use super::keymap::{Bind, KeyMap, Keysym};
+use crate::screen::{decode_pixel_value, normalize_masked_channel};
 use crate::{
-    Axis, Button, Coordinate, Direction, InputError, InputResult, Key, Keyboard, Mouse, NewConError,
+    Axis, Button, CaptureError, CaptureFrame, CaptureResult, Coordinate, Direction, Display,
+    DisplayId, InputBounds, InputError, InputResult, Key, Keyboard, Mouse, NewConError,
+    Screen as CaptureScreen,
 };
 
 type CompositorConnection = RustConnection<DefaultStream>;
@@ -28,6 +34,14 @@ pub struct Con {
     screen: Screen,
     keymap: KeyMap<Keycode>,
     modifiers: [Vec<Keycode>; 8],
+}
+
+struct CaptureGeometry {
+    id: String,
+    x: i16,
+    y: i16,
+    width: u16,
+    height: u16,
 }
 
 impl From<ConnectionError> for NewConError {
@@ -199,6 +213,63 @@ impl Con {
                 },
                 |d| Ok(d.device_id),
             )
+    }
+
+    fn capture_geometry(&self) -> CaptureGeometry {
+        match self.randr_primary_geometry() {
+            Ok(Some(geometry)) => geometry,
+            Ok(None) => self.root_geometry(),
+            Err(error) => {
+                warn!("unable to resolve the RandR primary output: {error}");
+                self.root_geometry()
+            }
+        }
+    }
+
+    fn root_geometry(&self) -> CaptureGeometry {
+        CaptureGeometry {
+            id: format!("x11-root-{}", self.screen.root),
+            x: 0,
+            y: 0,
+            width: self.screen.width_in_pixels,
+            height: self.screen.height_in_pixels,
+        }
+    }
+
+    fn randr_primary_geometry(&self) -> Result<Option<CaptureGeometry>, ReplyError> {
+        let output = self
+            .connection
+            .randr_get_output_primary(self.screen.root)?
+            .reply()?
+            .output;
+        if output == x11rb::NONE {
+            return Ok(None);
+        }
+        let resources = self
+            .connection
+            .randr_get_screen_resources_current(self.screen.root)?
+            .reply()?;
+        let output_info = self
+            .connection
+            .randr_get_output_info(output, resources.config_timestamp)?
+            .reply()?;
+        if output_info.crtc == x11rb::NONE {
+            return Ok(None);
+        }
+        let crtc = self
+            .connection
+            .randr_get_crtc_info(output_info.crtc, resources.config_timestamp)?
+            .reply()?;
+        if crtc.width == 0 || crtc.height == 0 {
+            return Ok(None);
+        }
+        Ok(Some(CaptureGeometry {
+            id: format!("x11-output-{output}"),
+            x: crtc.x,
+            y: crtc.y,
+            width: crtc.width,
+            height: crtc.height,
+        }))
     }
 }
 
@@ -437,23 +508,8 @@ impl Mouse for Con {
     }
 
     fn main_display(&self) -> InputResult<(i32, i32)> {
-        let main_display = self
-            .connection
-            .randr_get_screen_resources(self.screen.root)
-            .map_err(|e| {
-                error!("{e}");
-                InputError::Simulate("error when requesting randr_get_screen_resources with x11rb")
-            })?
-            .reply()
-            .map_err(|e| {
-                error!("{e}");
-                InputError::Simulate(
-                    "error with the reply of randr_get_screen_resources with x11rb",
-                )
-            })?
-            .modes[0];
-
-        Ok((main_display.width as i32, main_display.height as i32))
+        let geometry = self.capture_geometry();
+        Ok((geometry.width.into(), geometry.height.into()))
     }
 
     fn location(&self) -> InputResult<(i32, i32)> {
@@ -471,4 +527,119 @@ impl Mouse for Con {
             })?;
         Ok((reply.root_x as i32, reply.root_y as i32))
     }
+}
+
+impl CaptureScreen for Con {
+    fn displays(&mut self) -> CaptureResult<Vec<Display>> {
+        let geometry = self.capture_geometry();
+        let width = u32::from(geometry.width);
+        let height = u32::from(geometry.height);
+        Ok(vec![Display {
+            id: DisplayId(geometry.id),
+            name: Some("X11 primary display".into()),
+            primary: true,
+            input_bounds: InputBounds {
+                x: i32::from(geometry.x),
+                y: i32::from(geometry.y),
+                width,
+                height,
+            },
+            pixel_width: width,
+            pixel_height: height,
+        }])
+    }
+
+    fn capture(&mut self, display_id: &DisplayId) -> CaptureResult<CaptureFrame> {
+        let geometry = self.capture_geometry();
+        if display_id.0 != geometry.id {
+            return Err(CaptureError::DisplayNotFound);
+        }
+        let width = geometry.width;
+        let height = geometry.height;
+        let reply = self
+            .connection
+            .get_image(
+                ImageFormat::Z_PIXMAP,
+                self.screen.root,
+                geometry.x,
+                geometry.y,
+                width,
+                height,
+                u32::MAX,
+            )
+            .map_err(capture_error)?
+            .reply()
+            .map_err(capture_error)?;
+        let setup = self.connection.setup();
+        let format = setup
+            .pixmap_formats
+            .iter()
+            .find(|format| format.depth == reply.depth)
+            .ok_or(CaptureError::Unavailable(
+                "X11 pixmap format is unavailable",
+            ))?;
+        let visual = self
+            .screen
+            .allowed_depths
+            .iter()
+            .flat_map(|depth| depth.visuals.iter())
+            .find(|visual| visual.visual_id == reply.visual)
+            .ok_or(CaptureError::Unavailable("X11 visual is unavailable"))?;
+        let bits_per_pixel = usize::from(format.bits_per_pixel);
+        let bytes_per_pixel = bits_per_pixel.div_ceil(8);
+        if !(2..=4).contains(&bytes_per_pixel) {
+            return Err(CaptureError::Unavailable("X11 pixel format is unsupported"));
+        }
+        let scanline_pad = usize::from(format.scanline_pad);
+        let row_bits = usize::from(width)
+            .checked_mul(bits_per_pixel)
+            .ok_or(CaptureError::InvalidFrame("X11 row is too large"))?;
+        let row_bytes = row_bits
+            .div_ceil(scanline_pad)
+            .checked_mul(scanline_pad)
+            .and_then(|bits| bits.checked_div(8))
+            .ok_or(CaptureError::InvalidFrame("X11 row is too large"))?;
+        let expected_len = row_bytes
+            .checked_mul(usize::from(height))
+            .ok_or(CaptureError::InvalidFrame("X11 frame is too large"))?;
+        if reply.data.len() < expected_len {
+            return Err(CaptureError::InvalidFrame(
+                "X11 image payload is shorter than its geometry",
+            ));
+        }
+        let mut rgba = Vec::with_capacity(
+            usize::from(width)
+                .checked_mul(usize::from(height))
+                .and_then(|pixels| pixels.checked_mul(4))
+                .ok_or(CaptureError::InvalidFrame("X11 frame is too large"))?,
+        );
+        for row in reply.data.chunks_exact(row_bytes).take(usize::from(height)) {
+            for pixel in row.chunks_exact(bytes_per_pixel).take(usize::from(width)) {
+                let value =
+                    decode_pixel_value(pixel, setup.image_byte_order == ImageOrder::LSB_FIRST);
+                rgba.extend_from_slice(&[
+                    normalize_masked_channel(value, visual.red_mask),
+                    normalize_masked_channel(value, visual.green_mask),
+                    normalize_masked_channel(value, visual.blue_mask),
+                    255,
+                ]);
+            }
+        }
+        CaptureFrame::new(
+            display_id.clone(),
+            u32::from(width),
+            u32::from(height),
+            InputBounds {
+                x: i32::from(geometry.x),
+                y: i32::from(geometry.y),
+                width: u32::from(width),
+                height: u32::from(height),
+            },
+            rgba,
+        )
+    }
+}
+
+fn capture_error(error: impl std::fmt::Display) -> CaptureError {
+    CaptureError::Platform(error.to_string())
 }

@@ -2,6 +2,11 @@ use std::mem::size_of;
 
 use log::{debug, error, info, warn};
 use windows::Win32::Foundation::POINT;
+use windows::Win32::Graphics::Gdi::{
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleBitmap,
+    CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, HGDIOBJ,
+    ReleaseDC, SRCCOPY, SelectObject,
+};
 use windows::Win32::UI::{
     Input::KeyboardAndMouse::{
         GetKeyboardLayout, HKL, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS,
@@ -22,10 +27,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN, WHEEL_DELTA,
 };
 
+use crate::screen::bgra_to_rgba;
 use crate::{
-    Axis, Button, Coordinate, Direction, InputError, InputResult, Key, Keyboard, Mouse,
-    NewConError, Settings,
+    Axis, Button, CaptureError, CaptureFrame, CaptureResult, Coordinate, Direction, Display,
+    DisplayId, InputBounds, InputError, InputResult, Key, Keyboard, Mouse, NewConError, Screen,
+    Settings,
 };
+
+const PRIMARY_DISPLAY_ID: &str = "windows-primary";
 
 type ScanCode = u16;
 
@@ -310,6 +319,160 @@ impl Mouse for Enigo {
             ))
         }
     }
+}
+
+impl Screen for Enigo {
+    fn displays(&mut self) -> CaptureResult<Vec<Display>> {
+        let _dpi_guard = ThreadDpiAwarenessGuard::per_monitor();
+        let (width, height) = primary_dimensions()?;
+        Ok(vec![Display {
+            id: DisplayId(PRIMARY_DISPLAY_ID.into()),
+            name: Some("Primary display".into()),
+            primary: true,
+            input_bounds: InputBounds {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+            pixel_width: width,
+            pixel_height: height,
+        }])
+    }
+
+    fn capture(&mut self, display_id: &DisplayId) -> CaptureResult<CaptureFrame> {
+        if display_id.0 != PRIMARY_DISPLAY_ID {
+            return Err(CaptureError::DisplayNotFound);
+        }
+        let _dpi_guard = ThreadDpiAwarenessGuard::per_monitor();
+        let (width, height) = primary_dimensions()?;
+        let width_i32 = i32::try_from(width)
+            .map_err(|_| CaptureError::InvalidFrame("display width is too large"))?;
+        let height_i32 = i32::try_from(height)
+            .map_err(|_| CaptureError::InvalidFrame("display height is too large"))?;
+        let screen_dc = unsafe { GetDC(None) };
+        if screen_dc.is_invalid() {
+            return Err(CaptureError::Platform("GetDC failed".into()));
+        }
+        let memory_dc = unsafe { CreateCompatibleDC(Some(screen_dc)) };
+        if memory_dc.is_invalid() {
+            unsafe {
+                ReleaseDC(None, screen_dc);
+            }
+            return Err(CaptureError::Platform("CreateCompatibleDC failed".into()));
+        }
+        let bitmap = unsafe { CreateCompatibleBitmap(screen_dc, width_i32, height_i32) };
+        if bitmap.is_invalid() {
+            unsafe {
+                let _ = DeleteDC(memory_dc);
+                ReleaseDC(None, screen_dc);
+            }
+            return Err(CaptureError::Platform(
+                "CreateCompatibleBitmap failed".into(),
+            ));
+        }
+        let old_object = unsafe { SelectObject(memory_dc, HGDIOBJ(bitmap.0)) };
+        if old_object.is_invalid() {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(bitmap.0));
+                let _ = DeleteDC(memory_dc);
+                ReleaseDC(None, screen_dc);
+            }
+            return Err(CaptureError::Platform("SelectObject failed".into()));
+        }
+
+        let result = (|| {
+            unsafe {
+                BitBlt(
+                    memory_dc,
+                    0,
+                    0,
+                    width_i32,
+                    height_i32,
+                    Some(screen_dc),
+                    0,
+                    0,
+                    SRCCOPY | CAPTUREBLT,
+                )
+            }
+            .map_err(|error| CaptureError::Platform(error.to_string()))?;
+            let byte_len = usize::try_from(width)
+                .ok()
+                .and_then(|width| {
+                    usize::try_from(height)
+                        .ok()
+                        .and_then(|height| width.checked_mul(height))
+                })
+                .and_then(|pixels| pixels.checked_mul(4))
+                .ok_or(CaptureError::InvalidFrame(
+                    "display dimensions are too large",
+                ))?;
+            let mut bgra = vec![0_u8; byte_len];
+            let mut info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: u32::try_from(size_of::<BITMAPINFOHEADER>()).unwrap_or(u32::MAX),
+                    biWidth: width_i32,
+                    biHeight: -height_i32,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let rows = unsafe {
+                GetDIBits(
+                    memory_dc,
+                    bitmap,
+                    0,
+                    height,
+                    Some(bgra.as_mut_ptr().cast()),
+                    &raw mut info,
+                    DIB_RGB_COLORS,
+                )
+            };
+            if rows != height_i32 {
+                return Err(CaptureError::Platform("GetDIBits failed".into()));
+            }
+            bgra_to_rgba(&mut bgra);
+            CaptureFrame::new(
+                display_id.clone(),
+                width,
+                height,
+                InputBounds {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                },
+                bgra,
+            )
+        })();
+
+        unsafe {
+            SelectObject(memory_dc, old_object);
+            let _ = DeleteObject(HGDIOBJ(bitmap.0));
+            let _ = DeleteDC(memory_dc);
+            ReleaseDC(None, screen_dc);
+        }
+        result
+    }
+}
+
+fn primary_dimensions() -> CaptureResult<(u32, u32)> {
+    let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+    let height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+    if width <= 0 || height <= 0 {
+        return Err(CaptureError::Unavailable(
+            "primary display dimensions are unavailable",
+        ));
+    }
+    Ok((
+        u32::try_from(width)
+            .map_err(|_| CaptureError::InvalidFrame("display width is too large"))?,
+        u32::try_from(height)
+            .map_err(|_| CaptureError::InvalidFrame("display height is too large"))?,
+    ))
 }
 
 impl Keyboard for Enigo {

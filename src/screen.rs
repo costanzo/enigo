@@ -223,6 +223,41 @@ fn map_axis(
         .ok_or(CaptureError::InvalidRegion)
 }
 
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+pub(crate) fn decode_pixel_value(bytes: &[u8], little_endian: bool) -> u32 {
+    if little_endian {
+        bytes
+            .iter()
+            .enumerate()
+            .fold(0_u32, |value, (index, byte)| {
+                value | (u32::from(*byte) << (index * 8))
+            })
+    } else {
+        bytes
+            .iter()
+            .fold(0_u32, |value, byte| (value << 8) | u32::from(*byte))
+    }
+}
+
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+pub(crate) fn normalize_masked_channel(pixel: u32, mask: u32) -> u8 {
+    if mask == 0 {
+        return 0;
+    }
+    let shift = mask.trailing_zeros();
+    let maximum = mask >> shift;
+    let value = (pixel & mask) >> shift;
+    ((u64::from(value) * 255 + u64::from(maximum) / 2) / u64::from(maximum)) as u8
+}
+
+#[cfg(any(test, target_os = "windows"))]
+pub(crate) fn bgra_to_rgba(bytes: &mut [u8]) {
+    for pixel in bytes.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+        pixel[3] = 255;
+    }
+}
+
 fn validate_region(region: PixelRegion, width: u32, height: u32) -> CaptureResult<()> {
     if region.width == 0 || region.height == 0 {
         return Err(CaptureError::InvalidRegion);
@@ -378,5 +413,24 @@ mod tests {
                 .unwrap_err(),
             CaptureError::InvalidRegion
         );
+    }
+
+    #[test]
+    fn decodes_native_pixels_and_visual_masks() {
+        assert_eq!(
+            decode_pixel_value(&[0x33, 0x22, 0x11, 0], true),
+            0x0011_2233
+        );
+        assert_eq!(
+            decode_pixel_value(&[0, 0x11, 0x22, 0x33], false),
+            0x0011_2233
+        );
+        let pixel = 0x00AA_8040;
+        assert_eq!(normalize_masked_channel(pixel, 0x00FF_0000), 0xAA);
+        assert_eq!(normalize_masked_channel(pixel, 0x0000_FF00), 0x80);
+        assert_eq!(normalize_masked_channel(pixel, 0x0000_00FF), 0x40);
+        let mut bgra = [0x40, 0x80, 0xAA, 0];
+        bgra_to_rgba(&mut bgra);
+        assert_eq!(bgra, [0xAA, 0x80, 0x40, 255]);
     }
 }

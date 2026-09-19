@@ -3,10 +3,10 @@ pub use win_impl::Enigo;
 
 use crate::PermissionStatus;
 
-/// Windows does not expose one durable capture-authorization prompt.
+/// Primary-display GDI capture has no separate Windows authorization prompt.
 #[must_use]
 pub const fn capture_permission(_request: bool) -> PermissionStatus {
-    PermissionStatus::Unknown
+    PermissionStatus::Allowed
 }
 
 /// Windows input availability depends on the target process integrity level.

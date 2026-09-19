@@ -1,8 +1,9 @@
 use log::{debug, error, trace, warn};
 
 use crate::{
-    Axis, Button, Coordinate, Direction, InputError, InputResult, Key, Keyboard, Mouse,
-    NewConError, PermissionStatus, Settings,
+    Axis, Button, CaptureError, CaptureFrame, CaptureResult, Coordinate, Direction, Display,
+    DisplayId, InputError, InputResult, Key, Keyboard, Mouse, NewConError, PermissionStatus,
+    Screen as CaptureScreen, Settings,
 };
 
 /// Linux capture authorization is backend- and session-specific.
@@ -532,6 +533,29 @@ impl Mouse for Enigo {
             }
         }
         res
+    }
+}
+
+impl CaptureScreen for Enigo {
+    fn displays(&mut self) -> CaptureResult<Vec<Display>> {
+        #[cfg(feature = "x11rb")]
+        if let Some(connection) = self.x11.as_mut() {
+            return CaptureScreen::displays(connection);
+        }
+        Err(CaptureError::Unavailable(
+            "no active Linux capture backend is available",
+        ))
+    }
+
+    fn capture(&mut self, display_id: &DisplayId) -> CaptureResult<CaptureFrame> {
+        #[cfg(feature = "x11rb")]
+        if let Some(connection) = self.x11.as_mut() {
+            return CaptureScreen::capture(connection, display_id);
+        }
+        let _ = display_id;
+        Err(CaptureError::Unavailable(
+            "no active Linux capture backend is available",
+        ))
     }
 }
 
