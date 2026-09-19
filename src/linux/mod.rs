@@ -2,8 +2,20 @@ use log::{debug, error, trace, warn};
 
 use crate::{
     Axis, Button, Coordinate, Direction, InputError, InputResult, Key, Keyboard, Mouse,
-    NewConError, Settings,
+    NewConError, PermissionStatus, Settings,
 };
+
+/// Linux capture authorization is backend- and session-specific.
+#[must_use]
+pub const fn capture_permission(_request: bool) -> PermissionStatus {
+    PermissionStatus::Unknown
+}
+
+/// Linux input authorization is backend- and session-specific.
+#[must_use]
+pub const fn input_permission(_request: bool) -> PermissionStatus {
+    PermissionStatus::Unknown
+}
 
 // If none of these features is enabled, there is no way to simulate input
 #[cfg(not(any(

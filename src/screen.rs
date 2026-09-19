@@ -4,6 +4,16 @@ use std::fmt::{self, Display as FmtDisplay, Formatter};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+/// Current operating-system authorization for a desktop capability.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PermissionStatus {
+    Allowed,
+    Denied,
+    Unknown,
+    Unsupported,
+}
+
 /// Opaque identity for a display during the lifetime of a capture backend.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

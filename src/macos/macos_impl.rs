@@ -31,8 +31,8 @@ use objc2_foundation::NSPoint;
 
 use crate::{
     Axis, Button, CaptureError, CaptureFrame, CaptureResult, Coordinate, Direction, Display,
-    DisplayId, InputBounds, InputError, InputResult, Key, Keyboard, Mouse, NewConError, Screen,
-    Settings,
+    DisplayId, InputBounds, InputError, InputResult, Key, Keyboard, Mouse, NewConError,
+    PermissionStatus, Screen, Settings,
 };
 
 #[repr(C)]
@@ -77,6 +77,39 @@ unsafe extern "C" {
     ) -> OSStatus;
 
     fn LMGetKbdType() -> UInt8;
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGPreflightScreenCaptureAccess() -> bool;
+    fn CGRequestScreenCaptureAccess() -> bool;
+}
+
+/// Check or explicitly request macOS Screen Recording permission.
+#[must_use]
+pub fn capture_permission(request: bool) -> PermissionStatus {
+    let allowed = unsafe {
+        if request {
+            CGRequestScreenCaptureAccess()
+        } else {
+            CGPreflightScreenCaptureAccess()
+        }
+    };
+    if allowed {
+        PermissionStatus::Allowed
+    } else {
+        PermissionStatus::Denied
+    }
+}
+
+/// Check or explicitly request macOS Accessibility input permission.
+#[must_use]
+pub fn input_permission(request: bool) -> PermissionStatus {
+    if has_permission(request) {
+        PermissionStatus::Allowed
+    } else {
+        PermissionStatus::Denied
+    }
 }
 
 /// The main struct for handling the event emitting

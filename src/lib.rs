@@ -72,7 +72,7 @@ pub mod agent;
 #[cfg_attr(target_os = "macos", path = "macos/mod.rs")]
 #[cfg_attr(target_os = "windows", path = "win/mod.rs")]
 mod platform;
-pub use platform::Enigo;
+pub use platform::{Enigo, capture_permission, input_permission};
 
 mod keycodes;
 /// Contains the available keycodes
@@ -80,8 +80,8 @@ pub use keycodes::Key;
 
 mod screen;
 pub use screen::{
-    CaptureError, CaptureFrame, CaptureResult, Display, DisplayId, InputBounds, PixelPoint,
-    PixelRegion, Screen,
+    CaptureError, CaptureFrame, CaptureResult, Display, DisplayId, InputBounds, PermissionStatus,
+    PixelPoint, PixelRegion, Screen,
 };
 
 /// Arbitrary value to be able to distinguish events created by enigo
