@@ -50,7 +50,7 @@
 
 use std::{
     error::Error,
-    fmt::{self, Display, Formatter},
+    fmt::{self, Display as FmtDisplay, Formatter},
 };
 
 use log::{debug, error};
@@ -77,6 +77,12 @@ pub use platform::Enigo;
 mod keycodes;
 /// Contains the available keycodes
 pub use keycodes::Key;
+
+mod screen;
+pub use screen::{
+    CaptureError, CaptureFrame, CaptureResult, Display, DisplayId, InputBounds, PixelPoint,
+    PixelRegion, Screen,
+};
 
 /// Arbitrary value to be able to distinguish events created by enigo
 pub const EVENT_MARKER: u32 = 100;
@@ -419,7 +425,7 @@ pub enum InputError {
     InvalidInput(&'static str),
 }
 
-impl Display for InputError {
+impl FmtDisplay for InputError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let string = match self {
             InputError::Mapping(e) => format!("error when mapping keycode to keysym: ({e})"),
@@ -449,7 +455,7 @@ pub enum NewConError {
     NoEmptyKeycodes,
 }
 
-impl Display for NewConError {
+impl FmtDisplay for NewConError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let string = match self {
             NewConError::EstablishCon(e) => format!("no connection could be established: ({e})"),

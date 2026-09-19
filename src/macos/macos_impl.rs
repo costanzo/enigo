@@ -11,7 +11,14 @@ use core_foundation::{
     dictionary::{CFDictionary, CFDictionaryRef},
     string::{CFString, CFStringRef, UniChar},
 };
-use core_graphics::{display::CGDisplay, event::KeyCode};
+use core_graphics::{
+    base::kCGImageAlphaPremultipliedLast,
+    color_space::CGColorSpace,
+    context::CGContext,
+    display::CGDisplay,
+    event::KeyCode,
+    geometry::{CGPoint as LegacyCGPoint, CGRect, CGSize},
+};
 use log::{debug, error, info};
 use objc2::rc::Retained;
 use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
@@ -23,8 +30,9 @@ use objc2_core_graphics::{
 use objc2_foundation::NSPoint;
 
 use crate::{
-    Axis, Button, Coordinate, Direction, InputError, InputResult, Key, Keyboard, Mouse,
-    NewConError, Settings,
+    Axis, Button, CaptureError, CaptureFrame, CaptureResult, Coordinate, Direction, Display,
+    DisplayId, InputBounds, InputError, InputResult, Key, Keyboard, Mouse, NewConError, Screen,
+    Settings,
 };
 
 #[repr(C)]
@@ -220,7 +228,8 @@ impl Mouse for Enigo {
         debug!("\x1b[93mmove_mouse(x: {x:?}, y: {y:?}, coordinate:{coordinate:?})\x1b[0m");
 
         let (event_type, button) = self.move_type();
-        let (current_x, current_y) = self.location()?;
+        let current_point = self.mouse_location()?;
+        let (current_x, current_y) = self.point_to_pixel(current_point)?;
 
         let (absolute, relative) = match coordinate {
             // TODO: Check the bounds
@@ -229,7 +238,7 @@ impl Mouse for Enigo {
             Coordinate::Rel => ((current_x + x, current_y + y), (x, y)),
         };
 
-        let dest = CGPoint::new(absolute.0 as f64, absolute.1 as f64);
+        let dest = self.pixel_to_point(absolute.0, absolute.1)?;
         let event = CGEvent::new_mouse_event(Some(&self.event_source), event_type, dest, button)
             .ok_or(InputError::Simulate(
                 "failed creating event to move the mouse",
@@ -279,8 +288,73 @@ impl Mouse for Enigo {
 
     fn location(&self) -> InputResult<(i32, i32)> {
         debug!("\x1b[93mlocation()\x1b[0m");
-        let location = self.mouse_location()?;
-        Ok((location.x as i32, location.y as i32))
+        self.point_to_pixel(self.mouse_location()?)
+    }
+}
+
+impl Screen for Enigo {
+    fn displays(&mut self) -> CaptureResult<Vec<Display>> {
+        let display = CGDisplay::main();
+        Ok(vec![Display {
+            id: DisplayId(display.id.to_string()),
+            name: Some("Primary display".into()),
+            primary: true,
+            input_bounds: InputBounds {
+                x: 0,
+                y: 0,
+                width: display.pixels_wide() as u32,
+                height: display.pixels_high() as u32,
+            },
+            pixel_width: display.pixels_wide() as u32,
+            pixel_height: display.pixels_high() as u32,
+        }])
+    }
+
+    fn capture(&mut self, display_id: &DisplayId) -> CaptureResult<CaptureFrame> {
+        let display = CGDisplay::main();
+        if display_id.0 != display.id.to_string() {
+            return Err(CaptureError::DisplayNotFound);
+        }
+        let image = display.image().ok_or(CaptureError::PermissionDenied)?;
+        let width = image.width();
+        let height = image.height();
+        let colorspace = CGColorSpace::create_device_rgb();
+        let mut context = CGContext::create_bitmap_context(
+            None,
+            width,
+            height,
+            8,
+            width
+                .checked_mul(4)
+                .ok_or(CaptureError::InvalidFrame("frame dimensions are too large"))?,
+            &colorspace,
+            kCGImageAlphaPremultipliedLast,
+        );
+        context.translate(0.0, height as f64);
+        context.scale(1.0, -1.0);
+        context.draw_image(
+            CGRect::new(
+                &LegacyCGPoint::new(0.0, 0.0),
+                &CGSize::new(width as f64, height as f64),
+            ),
+            &image,
+        );
+        context.flush();
+        let rgba = context.data().to_vec();
+        CaptureFrame::new(
+            display_id.clone(),
+            u32::try_from(width)
+                .map_err(|_| CaptureError::InvalidFrame("frame width is too large"))?,
+            u32::try_from(height)
+                .map_err(|_| CaptureError::InvalidFrame("frame height is too large"))?,
+            InputBounds {
+                x: 0,
+                y: 0,
+                width: display.pixels_wide() as u32,
+                height: display.pixels_high() as u32,
+            },
+            rgba,
+        )
     }
 }
 
@@ -983,6 +1057,31 @@ impl Enigo {
                 .ok_or(InputError::Simulate("failed to create CGEvent"))?;
             Ok(objc2_core_graphics::CGEvent::location(Some(&event)))
         }
+    }
+
+    fn display_scale(&self) -> InputResult<(f64, f64)> {
+        let display = CGDisplay::main();
+        let bounds = display.bounds();
+        if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
+            return Err(InputError::Simulate("main display bounds are invalid"));
+        }
+        Ok((
+            display.pixels_wide() as f64 / bounds.size.width,
+            display.pixels_high() as f64 / bounds.size.height,
+        ))
+    }
+
+    fn point_to_pixel(&self, point: CGPoint) -> InputResult<(i32, i32)> {
+        let (scale_x, scale_y) = self.display_scale()?;
+        Ok((
+            (point.x * scale_x).round() as i32,
+            (point.y * scale_y).round() as i32,
+        ))
+    }
+
+    fn pixel_to_point(&self, x: i32, y: i32) -> InputResult<CGPoint> {
+        let (scale_x, scale_y) = self.display_scale()?;
+        Ok(CGPoint::new(f64::from(x) / scale_x, f64::from(y) / scale_y))
     }
 
     fn move_type(&self) -> (CGEventType, CGMouseButton) {
